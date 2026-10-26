@@ -1,0 +1,242 @@
+import math
+import re
+from pathlib import Path
+from typing import Any, Literal, Optional
+
+import numpy as np
+import pandas as pd
+from fastapi import FastAPI, HTTPException, Query
+from fastapi.middleware.cors import CORSMiddleware
+from fastapi.middleware.gzip import GZipMiddleware
+
+# ----------------------------------------------------------------------------
+# تنظیمات اپلیکیشن
+# ----------------------------------------------------------------------------
+app = FastAPI(
+    title="Electric Cars API",
+    version="1.1.0",
+    description="API نمایش دیتاست خودروهای برقی (فیلتر، جستجو، مرتب‌سازی، صفحه‌بندی و آمار)",
+)
+
+# نکته: allow_origins=["*"] با allow_credentials=True طبق استاندارد مرورگرها معتبر نیست.
+# چون کوکی/لاگین نداریم، credentials را False می‌گذاریم.
+# اگر در آینده لاگین اضافه شد، آدرس دقیق فرانت را جای "*" بنویسید.
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_credentials=False,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+app.add_middleware(GZipMiddleware, minimum_size=1000)
+
+# ----------------------------------------------------------------------------
+# بارگذاری دیتاست
+# ----------------------------------------------------------------------------
+CSV_NAME = "electric_cars_cleaned_v2.csv"
+BASE_DIR = Path(__file__).resolve().parent
+
+CSV_FILE = next(
+    (p for p in (BASE_DIR / CSV_NAME, BASE_DIR.parent / CSV_NAME, Path(CSV_NAME)) if p.is_file()),
+    None,
+)
+if CSV_FILE is None:
+    raise FileNotFoundError(f"فایل دیتاسورس پیدا نشد: {CSV_NAME}")
+
+NUMBER_RE = re.compile(r"[-+]?\d*\.?\d+")
+
+
+def clean_numeric(val: Any) -> float:
+    """استخراج اولین عدد از یک مقدار (مثل '218,000' یا '2.5 sec') و تبدیل به float."""
+    if val is None:
+        return np.nan
+    if isinstance(val, (int, float, np.number)):
+        return float(val) if not pd.isna(val) else np.nan
+    if pd.isna(val):
+        return np.nan
+    # حذف کاما (جداکننده هزارگان) و استخراج اولین عدد
+    match = NUMBER_RE.search(str(val).replace(",", ""))
+    if not match:
+        return np.nan
+    try:
+        return float(match.group())
+    except ValueError:
+        return np.nan
+
+
+df = pd.read_csv(CSV_FILE, encoding="utf-8-sig")
+df.columns = [c.strip() for c in df.columns]
+
+REQUIRED_COLUMNS = [
+    "Name", "Battery", "Availability", "Acceleration", "TopSpeed", "Range",
+    "Efficiency", "FastChargeSpeed", "Drive", "NumberofSeats",
+    "PriceinGermany_EUR", "PriceinUK_GBP", "Estimated_Fields",
+]
+missing = [c for c in REQUIRED_COLUMNS if c not in df.columns]
+if missing:
+    raise ValueError(f"ستون‌های زیر در دیتاست وجود ندارند: {missing}")
+
+# ستون‌های عددی کمکی برای فیلتر و مرتب‌سازی
+df["range_num"] = df["Range"].apply(clean_numeric)
+df["accel_num"] = df["Acceleration"].apply(clean_numeric)
+df["speed_num"] = df["TopSpeed"].apply(clean_numeric)
+df["battery_num"] = df["Battery"].apply(clean_numeric)
+df["price_eur_num"] = df["PriceinGermany_EUR"].apply(clean_numeric)
+df["id"] = df.index.astype(int)
+
+# ستون‌های متنی برای فیلتر سریع‌تر (یک‌بار محاسبه می‌شود)
+df["_name_lower"] = df["Name"].fillna("").astype(str).str.lower()
+df["_drive_lower"] = df["Drive"].fillna("").astype(str).str.strip().str.lower()
+
+DISPLAY_COLS = [
+    "id", "Name", "Battery", "Availability", "Acceleration", "TopSpeed",
+    "Range", "Efficiency", "FastChargeSpeed", "Drive", "NumberofSeats",
+    "PriceinGermany_EUR", "PriceinUK_GBP", "Estimated_Fields",
+]
+# ستون‌هایی که در جزئیات یک خودرو نباید نمایش داده شوند
+HIDDEN_COLS = {c for c in df.columns if c.endswith("_num") or c.startswith("_")}
+
+SortField = Literal["id", "price_eur_num", "range_num", "accel_num", "speed_num", "battery_num"]
+
+
+# ----------------------------------------------------------------------------
+# توابع کمکی
+# ----------------------------------------------------------------------------
+def to_python(value: Any) -> Any:
+    """تبدیل مقدارهای numpy/pandas به نوع‌های استاندارد پایتون؛ NaN/inf → None."""
+    if value is None:
+        return None
+    if isinstance(value, np.generic):
+        value = value.item()
+    if isinstance(value, float) and (math.isnan(value) or math.isinf(value)):
+        return None
+    try:
+        if pd.isna(value):
+            return None
+    except (TypeError, ValueError):
+        pass
+    return value
+
+
+def to_records(frame: pd.DataFrame) -> list[dict]:
+    return [
+        {k: to_python(v) for k, v in row.items()}
+        for row in frame.to_dict(orient="records")
+    ]
+
+
+def safe_float(value: Any, ndigits: Optional[int] = None) -> Optional[float]:
+    value = to_python(value)
+    if value is None:
+        return None
+    value = float(value)
+    return round(value, ndigits) if ndigits is not None else value
+
+
+def summary(series: pd.Series, ndigits: int) -> dict:
+    s = series.dropna()
+    if s.empty:
+        return {"min": None, "max": None, "avg": None}
+    return {
+        "min": safe_float(s.min()),
+        "max": safe_float(s.max()),
+        "avg": safe_float(s.mean(), ndigits),
+    }
+
+
+# ----------------------------------------------------------------------------
+# Endpoints
+# ----------------------------------------------------------------------------
+@app.get("/")
+def root():
+    return {"status": "online", "total_records": len(df)}
+
+
+@app.get("/api/cars")
+def get_cars(
+    search: Optional[str] = Query(None, max_length=100, description="جستجو در نام خودرو"),
+    drive: Optional[str] = Query(None, max_length=50, description="نوع Drive (مثلاً AWD)"),
+    seats: Optional[int] = Query(None, ge=1, le=20),
+    min_range: Optional[float] = Query(None, ge=0),
+    max_range: Optional[float] = Query(None, ge=0),
+    min_price: Optional[float] = Query(None, ge=0),
+    max_price: Optional[float] = Query(None, ge=0),
+    sort_by: SortField = Query("id"),
+    sort_order: Literal["asc", "desc"] = Query("asc"),
+    page: int = Query(1, ge=1),
+    page_size: int = Query(12, ge=1, le=100),
+):
+    if min_range is not None and max_range is not None and min_range > max_range:
+        raise HTTPException(status_code=400, detail="min_range نمی‌تواند از max_range بزرگ‌تر باشد.")
+    if min_price is not None and max_price is not None and min_price > max_price:
+        raise HTTPException(status_code=400, detail="min_price نمی‌تواند از max_price بزرگ‌تر باشد.")
+
+    # ساخت ماسک فیلتر (بدون کپی کردن کل دیتافریم)
+    mask = pd.Series(True, index=df.index)
+
+    if search and search.strip():
+        # regex=False تا کاراکترهای خاص مثل ( یا + باعث خطا نشوند
+        mask &= df["_name_lower"].str.contains(search.strip().lower(), regex=False)
+
+    if drive and drive.strip():
+        mask &= df["_drive_lower"] == drive.strip().lower()
+
+    if seats is not None:
+        mask &= df["NumberofSeats"] == seats
+
+    if min_range is not None:
+        mask &= df["range_num"] >= min_range
+    if max_range is not None:
+        mask &= df["range_num"] <= max_range
+
+    if min_price is not None:
+        mask &= df["price_eur_num"] >= min_price
+    if max_price is not None:
+        mask &= df["price_eur_num"] <= max_price
+
+    result = df[mask]
+
+    # مرتب‌سازی پایدار؛ مقدارهای خالی همیشه آخر لیست؛ در تساوی بر اساس id
+    result = result.sort_values(
+        by=[sort_by, "id"] if sort_by != "id" else ["id"],
+        ascending=[sort_order == "asc", True] if sort_by != "id" else [sort_order == "asc"],
+        na_position="last",
+        kind="mergesort",
+    )
+
+    total_items = len(result)
+    total_pages = math.ceil(total_items / page_size) if total_items else 0
+    start = (page - 1) * page_size
+    page_df = result[DISPLAY_COLS].iloc[start:start + page_size]
+
+    return {
+        "page": page,
+        "page_size": page_size,
+        "total_items": total_items,
+        "total_pages": total_pages,
+        "items": to_records(page_df),
+    }
+
+
+@app.get("/api/cars/{car_id}")
+def get_car_by_id(car_id: int):
+    selected = df[df["id"] == car_id]
+    if selected.empty:
+        raise HTTPException(status_code=404, detail="خودرو یافت نشد.")
+
+    row = selected.iloc[0].to_dict()
+    return {k: to_python(v) for k, v in row.items() if k not in HIDDEN_COLS}
+
+
+@app.get("/api/statistics")
+def get_statistics():
+    seats = pd.to_numeric(df["NumberofSeats"], errors="coerce").dropna().astype(int)
+    drives = df["Drive"].dropna().astype(str).str.strip()
+
+    return {
+        "total_cars": len(df),
+        "drive_types": {k: int(v) for k, v in drives.value_counts().items()},
+        "seat_options": sorted(seats.unique().tolist()),
+        "price_summary_eur": summary(df["price_eur_num"], 2),
+        "range_summary_km": summary(df["range_num"], 1),
+    }
