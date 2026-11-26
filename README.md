@@ -5,4 +5,8 @@ Dataset: https://www.kaggle.com/datasets/kkhandekar/cheapest-electric-cars
 
 Live site: https://it-project1234.github.io/it-project/
 
-Roles: 
+Roles:
+- پارسا سلیمی: Project Manager
+- احمد بوالحسنی: API
+- علی رضایی: Backend
+- علی ابراهیمی: Frontend
