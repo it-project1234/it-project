@@ -1,7 +1,8 @@
-# عنوان پروژه
+# Cheapest Electric Cars
+
 Members: احمد بوالحسنی ، علی رضایی ، علی ابراهیمی ، پارسا سلیمی
 
-Dataset: https://www.kaggle.com/datasets/kkhandekar/cheapest-electric-cars
+Dataset: Cheapest Electric Cars - https://www.kaggle.com/datasets/kkhandekar/cheapest-electric-cars
 
 Live site: https://it-project1234.github.io/it-project/
 
